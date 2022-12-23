@@ -15,6 +15,12 @@ pub struct PersistentState {
 pub struct ElectionTimeout;
 
 #[derive(Clone)]
+pub enum HeartbeatTimeout {
+    First,
+    NotFirst,
+}
+
+#[derive(Clone)]
 pub struct Init;
 
 /// State of a Raft process with a corresponding (volatile) information.
@@ -22,7 +28,12 @@ pub struct Init;
 pub enum ProcessType {
     Follower,
     Candidate { votes_received: HashSet<Uuid> },
-    Leader { next_index: HashMap<Uuid, u64>, match_index: HashMap<Uuid, u64> },
+    Leader { 
+        next_index: HashMap<Uuid, u64>, 
+        match_index: HashMap<Uuid, u64>, 
+        heartbeats_received: HashSet<Uuid>,
+        last_hearbeat_round_successful: bool,
+    },
 }
 
 impl Default for ProcessType {
@@ -78,5 +89,14 @@ impl PersistentState {
 
     pub fn log(&self) -> &Vec<LogEntry> {
         &self.log
+    }
+
+    pub async fn append_log(&mut self, log: LogEntry) {
+        let next_idx = self.log.len();
+        self.stable_storage
+            .put(&format!("log_{}", next_idx), &bincode::serialize(&log).unwrap())
+            .await
+            .unwrap();
+        self.log.push(log);
     }
 }

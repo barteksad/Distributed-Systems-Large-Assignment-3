@@ -1,9 +1,11 @@
 use std::{
+    cmp::min,
     collections::HashSet,
+    ops::Sub,
     time::{Duration, SystemTime},
 };
 
-use basic_raft::{ElectionTimeout, Init, PersistentState, ProcessType};
+use basic_raft::{ElectionTimeout, HeartbeatTimeout, Init, PersistentState, ProcessType};
 use executor::{Handler, ModuleRef, System, TimerHandle};
 
 pub use domain::*;
@@ -16,7 +18,7 @@ mod domain;
 pub struct Raft {
     config: ServerConfig,
     pstate: PersistentState,
-    commit_index: u64,
+    commit_index: usize,
     last_applied: u64,
     state_machine: Box<dyn StateMachine>,
     message_sender: Box<dyn RaftSender>,
@@ -88,6 +90,64 @@ impl Raft {
         );
     }
 
+    async fn send_append_entries(&mut self) {
+        if let ProcessType::Leader {
+            next_index,
+            match_index,
+            ..
+        } = &self.process_type
+        {
+            let current_term = self.pstate.current_term();
+            let leader_id = self.config.self_id;
+            let prev_log_index = self.pstate.log().len() - 1;
+            let prev_log_term = self.pstate.log().last().map(|e| e.term).unwrap();
+            let leader_commit = self.commit_index;
+
+            for server in &self.config.servers {
+                if server == &self.config.self_id {
+                    continue;
+                }
+
+                let next_index = next_index.get(server).unwrap();
+                let match_index = match_index.get(server).unwrap();
+                let entries = match *next_index == (match_index + 1) {
+                    true => {
+                        let rhs: usize = (*next_index).try_into().unwrap();
+                        let take_n = min(
+                            self.config.append_entries_batch_size,
+                            self.pstate.log().len() - rhs,
+                        );
+                        self.pstate
+                            .log()
+                            .iter()
+                            .skip((*next_index).try_into().unwrap())
+                            .take(take_n)
+                            .cloned()
+                            .collect()
+                    }
+                    false => vec![],
+                };
+
+                let msg = RaftMessage {
+                    header: RaftMessageHeader {
+                        term: current_term,
+                        source: leader_id,
+                    },
+                    content: RaftMessageContent::AppendEntries(AppendEntriesArgs {
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    }),
+                };
+
+                self.message_sender.send(server, msg).await;
+            }
+        } else {
+            panic!("send_append_entries called on non-leader");
+        }
+    }
+
     async fn handle_request_vote(
         &mut self,
         header: &RaftMessageHeader,
@@ -145,7 +205,7 @@ impl Raft {
     async fn handle_request_vote_response(
         &mut self,
         header: &RaftMessageHeader,
-        args: RequestVoteResponseArgs
+        args: RequestVoteResponseArgs,
     ) {
         match &mut self.process_type {
             ProcessType::Follower => return,
@@ -157,18 +217,45 @@ impl Raft {
                 } else if args.vote_granted {
                     votes_received.insert(header.source);
                     if votes_received.len() > (self.config.servers.len() + 1) / 2 {
-                        self.process_type = ProcessType::Leader {
-                            next_index: self.config.servers.iter().map(|uid| (*uid, (self.pstate.log().len() + 1) as u64)).collect(),
-                            match_index: self.config.servers.iter().map(|uid| (*uid, 0)).collect(),
-                        }};
                         self.current_leader = Some(self.config.self_id);
                         self.last_leader_timestamp = None;
-                    }
+                        // When a server becomes a leader, it must append a NoOp entry to the log (nextIndex must be initialized with the index of this entry).
+                        self.pstate
+                            .append_log(LogEntry {
+                                content: LogEntryContent::NoOp,
+                                term: self.pstate.current_term(),
+                                timestamp: SystemTime::now(),
+                            })
+                            .await;
+                        self.process_type = ProcessType::Leader {
+                            next_index: self
+                                .config
+                                .servers
+                                .iter()
+                                .map(|uid| {
+                                    (*uid, (self.pstate.log().len() + 1).try_into().unwrap())
+                                })
+                                .collect(),
+                            match_index: self.config.servers.iter().map(|uid| (*uid, 0)).collect(),
+                            heartbeats_received: HashSet::from([self.config.self_id]),
+                            last_hearbeat_round_successful: true,
+                        }
+                    };
+                    self.self_ref
+                        .as_ref()
+                        .unwrap()
+                        .send(HeartbeatTimeout::First)
+                        .await;
+                    self.self_ref
+                        .as_ref()
+                        .unwrap()
+                        .request_tick(HeartbeatTimeout::NotFirst, self.config.heartbeat_timeout)
+                        .await;
                 }
             }
         }
     }
-
+}
 
 #[async_trait::async_trait]
 impl Handler<RaftMessage> for Raft {
@@ -180,7 +267,7 @@ impl Handler<RaftMessage> for Raft {
             RaftMessageContent::RequestVoteResponse(args) => {
                 self.handle_request_vote_response(&msg.header, args).await;
                 None
-            },
+            }
             _ => unimplemented!(),
         };
 
@@ -251,4 +338,9 @@ impl Handler<ElectionTimeout> for Raft {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl Handler<HeartbeatTimeout> for Raft {
+    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, _msg: HeartbeatTimeout) {}
 }
