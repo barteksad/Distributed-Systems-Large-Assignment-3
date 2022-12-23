@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{time::SystemTime, collections::{HashSet, HashMap}};
 
 use uuid::Uuid;
 
@@ -9,6 +9,26 @@ pub struct PersistentState {
     voted_for: Option<Uuid>,
     log: Vec<LogEntry>,
     stable_storage: Box<dyn StableStorage>,
+}
+
+#[derive(Clone)]
+pub struct ElectionTimeout;
+
+#[derive(Clone)]
+pub struct Init;
+
+/// State of a Raft process with a corresponding (volatile) information.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProcessType {
+    Follower,
+    Candidate { votes_received: HashSet<Uuid> },
+    Leader { next_index: HashMap<Uuid, u64>, match_index: HashMap<Uuid, u64> },
+}
+
+impl Default for ProcessType {
+    fn default() -> Self {
+        ProcessType::Follower
+    }
 }
 
 impl PersistentState {
@@ -48,11 +68,15 @@ impl PersistentState {
         self.current_term
     }
 
-    pub async fn set_current_tern(&mut self, new_term: u64) {
+    pub async fn set_current_term(&mut self, new_term: u64) {
         self.stable_storage
             .put("current_term", &bincode::serialize(&new_term).unwrap())
             .await
             .unwrap();
         self.current_term = new_term;
+    }
+
+    pub fn log(&self) -> &Vec<LogEntry> {
+        &self.log
     }
 }
