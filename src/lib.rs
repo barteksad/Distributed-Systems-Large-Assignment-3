@@ -255,6 +255,67 @@ impl Raft {
             }
         }
     }
+
+    async fn handle_append_entries(
+        &mut self,
+        header: &RaftMessageHeader,
+        args: AppendEntriesArgs,
+    ) -> Option<RaftMessageContent> {
+        if header.term < self.pstate.current_term() {
+            self.update_term(header.term).await;
+            Some(RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
+                success: false,
+                last_verified_log_index: args.prev_log_index + args.entries.len(),
+            }))
+        } else {
+            if header.term > self.pstate.current_term() {
+                self.update_term(header.term).await;
+            }
+            self.reset_election_timer().await;
+            self.current_leader = Some(header.source);
+            self.last_leader_timestamp = Some(SystemTime::now());
+            self.process_type = ProcessType::Follower;
+
+            let prev_log_index = args.prev_log_index;
+            match self.pstate.log().get(prev_log_index) {
+                Some(LogEntry { content, term, timestamp }) => {
+                    let last_verified_log_index = args.prev_log_index + args.entries.len();
+                    let success = match *term == args.prev_log_term {
+                        false => {
+                            self.pstate.delete_logs_from(prev_log_index).await;
+                            false
+                        },
+                        true => {
+                            for entry in args.entries {
+                                self.pstate.append_log(entry).await;
+                            }
+                            while self.commit_index < args.leader_commit {
+                                match self.pstate.log().get(self.commit_index).unwrap() {
+                                    LogEntry { content: LogEntryContent::Command { data, ..}, .. } => {
+                                        self.state_machine.apply(data).await;
+                                    },
+                                    _ => (),
+                                }
+                                self.commit_index += 1;
+                            }
+                            true
+                        }
+                    };
+                    return Some(RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
+                        success,
+                        last_verified_log_index,
+                    }));
+                },
+                None => {
+                    return Some(RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
+                        success: false,
+                        last_verified_log_index: args.prev_log_index + args.entries.len(),
+                    }));
+                },
+            }
+            }
+            
+    }
 }
 
 #[async_trait::async_trait]
@@ -268,6 +329,9 @@ impl Handler<RaftMessage> for Raft {
                 self.handle_request_vote_response(&msg.header, args).await;
                 None
             }
+            RaftMessageContent::AppendEntries(args) => {
+                self.handle_append_entries(&msg.header, args).await
+            },
             _ => unimplemented!(),
         };
 
@@ -342,5 +406,19 @@ impl Handler<ElectionTimeout> for Raft {
 
 #[async_trait::async_trait]
 impl Handler<HeartbeatTimeout> for Raft {
-    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, _msg: HeartbeatTimeout) {}
+    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: HeartbeatTimeout) {
+        self.send_append_entries().await;
+        if let ProcessType::Leader { heartbeats_received, last_hearbeat_round_successful, .. } = &mut self.process_type {
+            let majority_count = self.config.servers.len()/2 + self.config.servers.len() % 2;
+            *last_hearbeat_round_successful = match (msg, heartbeats_received.len() > majority_count) {
+                (HeartbeatTimeout::First, _) => true,
+                (HeartbeatTimeout::NotFirst, val) => val,
+            };
+
+            heartbeats_received.clear();
+            heartbeats_received.insert(self.config.self_id);
+        } else {
+            panic!("HeartbeatTimeout received by non-leader")
+        }
+    }
 }

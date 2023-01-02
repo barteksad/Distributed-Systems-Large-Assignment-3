@@ -99,4 +99,12 @@ impl PersistentState {
             .unwrap();
         self.log.push(log);
     }
+
+    pub async fn delete_logs_from(&mut self, idx: usize) {
+        unimplemented!();
+        // for i in idx..self.log.len() {
+        //     self.stable_storage.delete(&format!("log_{}", i)).await.unwrap();
+        // }
+        // self.log.truncate(idx);
+    }
 }
