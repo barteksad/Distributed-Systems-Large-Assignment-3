@@ -1,8 +1,10 @@
 use std::{time::SystemTime, collections::{HashSet, HashMap}};
 
+use async_channel::Sender;
+use log::debug;
 use uuid::Uuid;
 
-use crate::{LogEntry, LogEntryContent, ServerConfig, StableStorage};
+use crate::{LogEntry, LogEntryContent, ServerConfig, StableStorage, ClientRequestResponse};
 
 pub struct PersistentState {
     current_term: u64,
@@ -24,7 +26,7 @@ pub enum HeartbeatTimeout {
 pub struct Init;
 
 /// State of a Raft process with a corresponding (volatile) information.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ProcessType {
     Follower,
     Candidate { votes_received: HashSet<Uuid> },
@@ -33,6 +35,7 @@ pub enum ProcessType {
         match_index: HashMap<Uuid, u64>, 
         heartbeats_received: HashSet<Uuid>,
         last_hearbeat_round_successful: bool,
+        client_id2tx: HashMap<Uuid, Sender<ClientRequestResponse>>,
     },
 }
 
@@ -52,15 +55,35 @@ impl PersistentState {
         PersistentState {
             current_term: 0,
             voted_for: None,
-            log: vec![LogEntry {
+            log: Self::restore_logs(&stable_storage, config, first_log_entry_timestamp).await,
+            stable_storage,
+        }
+    }
+
+    async fn restore_logs(stable_storage: &Box<dyn StableStorage>, config: &ServerConfig, first_log_entry_timestamp: SystemTime) -> Vec<LogEntry> {
+        let mut logs = vec![];
+        let mut idx = 0;
+        loop {
+            let log = stable_storage.get(&format!("log_{}", idx)).await;
+            match log {
+                Some(log) => {
+                    logs.push(bincode::deserialize(&log).unwrap());
+                    idx += 1;
+                }
+                None => break,
+            }
+        }
+        if logs.is_empty() {
+            logs.push(LogEntry {
                 term: 0,
                 timestamp: first_log_entry_timestamp,
                 content: LogEntryContent::Configuration {
                     servers: config.servers.clone(),
                 },
-            }],
-            stable_storage,
+            });
         }
+        debug!("Initial logs: {:?}", logs);
+        logs
     }
 
     pub fn voted_for(&self) -> Option<Uuid> {
@@ -101,10 +124,6 @@ impl PersistentState {
     }
 
     pub async fn delete_logs_from(&mut self, idx: usize) {
-        unimplemented!();
-        // for i in idx..self.log.len() {
-        //     self.stable_storage.delete(&format!("log_{}", i)).await.unwrap();
-        // }
-        // self.log.truncate(idx);
+        self.log.truncate(idx);
     }
 }
