@@ -1,5 +1,5 @@
 use std::{
-    cmp::min,
+    cmp::{max, min},
     collections::{HashMap, HashSet},
     time::{Duration, SystemTime},
 };
@@ -8,7 +8,7 @@ use basic_raft::{ElectionTimeout, HeartbeatTimeout, Init, PersistentState, Proce
 use executor::{Handler, ModuleRef, System, TimerHandle};
 
 pub use domain::*;
-use log::{debug, info, error};
+use log::{debug, error, info};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -76,10 +76,6 @@ impl Raft {
 
         let election_min = self.config.election_timeout_range.start().as_micros();
         let election_max = self.config.election_timeout_range.end().as_micros();
-        debug!(
-            "Election timeout range: [{}, {}]",
-            election_min, election_max
-        );
         let timeout = Duration::from_micros(
             rand::thread_rng()
                 .gen_range(election_min..=election_max)
@@ -124,7 +120,6 @@ impl Raft {
 
                 let next_index = next_index.get(server).unwrap();
                 let match_index = match_index.get(server).unwrap();
-                debug!("next_index: {}, match_index: {}", next_index, match_index);
                 let entries = match *next_index == (match_index + 1) {
                     true => {
                         let rhs: usize = (*next_index).try_into().unwrap();
@@ -132,7 +127,6 @@ impl Raft {
                             self.config.append_entries_batch_size,
                             self.pstate.log().len() - rhs,
                         );
-                        debug!("have: {}, skipping: {}, take_n: {}",self.pstate.log().len(), next_index, take_n);
                         self.pstate
                             .log()
                             .iter()
@@ -143,9 +137,13 @@ impl Raft {
                     }
                     false => vec![],
                 };
-                
-                // debug!("next_index: {}, match_index: {}, entries: {}", next_index, match_index, entries.len());
-                let prev_log_term = self.pstate.log().get(*match_index as usize).map(|e| e.term).unwrap();
+
+                let prev_log_term = self
+                    .pstate
+                    .log()
+                    .get(*match_index as usize)
+                    .map(|e| e.term)
+                    .unwrap();
 
                 // Used after receiving successful AppendEntries response
                 if target_one.is_some() && entries.is_empty() {
@@ -164,11 +162,6 @@ impl Raft {
                         leader_commit,
                     }),
                 };
-
-                debug!(
-                    "Sending AppendEntries to {:?} with term {} with content: {:?}",
-                    server, current_term, msg.content);
-
                 self.message_sender.send(server, msg).await;
             }
         } else {
@@ -181,10 +174,6 @@ impl Raft {
         header: &RaftMessageHeader,
         args: RequestVoteArgs,
     ) -> Option<RaftMessageContent> {
-        debug!(
-            "Received RequestVote from {:?} with term {}",
-            header.source, header.term
-        );
         // (Chapter 4.2.3 of [1])
         if let Some(timestamp) = self.last_leader_timestamp {
             if timestamp.elapsed().unwrap() <= *self.config.election_timeout_range.start() {
@@ -231,7 +220,9 @@ impl Raft {
                 ))
             }
             false => Some(RaftMessageContent::RequestVoteResponse(
-                RequestVoteResponseArgs { vote_granted: false },
+                RequestVoteResponseArgs {
+                    vote_granted: false,
+                },
             )),
         }
     }
@@ -263,11 +254,6 @@ impl Raft {
         header: &RaftMessageHeader,
         args: AppendEntriesArgs,
     ) -> Option<RaftMessageContent> {
-        debug!(
-            "Received AppendEntries header: {:?}, content: {:?}",
-            header, args
-        );
-        debug!("My logs are: {:?}", self.pstate.log());
         if header.term < self.pstate.current_term() {
             // self.update_term(header.term).await;
             Some(RaftMessageContent::AppendEntriesResponse(
@@ -289,7 +275,6 @@ impl Raft {
             }
 
             let prev_log_index = args.prev_log_index;
-            debug!("prev_log_index: {}, log: {:?}", prev_log_index, self.pstate.log().get(prev_log_index));
             match self.pstate.log().get(prev_log_index) {
                 Some(LogEntry { term, .. }) => {
                     let last_verified_log_index = args.prev_log_index + args.entries.len();
@@ -323,9 +308,6 @@ impl Raft {
                             true
                         }
                     };
-                    debug!(
-                        "Responding to AppendEntries from {:?} with success {}",
-                        header.source, success);
                     return Some(RaftMessageContent::AppendEntriesResponse(
                         AppendEntriesResponseArgs {
                             success,
@@ -351,7 +333,6 @@ impl Raft {
         args: AppendEntriesResponseArgs,
     ) -> Option<RaftMessageContent> {
         if header.term > self.pstate.current_term() {
-            debug!("Updating term to {} from {}", header.term, self.pstate.current_term());
             self.update_term(header.term).await;
             self.process_type = ProcessType::Follower;
             if let Some(timer_handle) = self.heartbeat_timer_handle.take() {
@@ -364,6 +345,8 @@ impl Raft {
                     match_index,
                     heartbeats_received,
                     client_id2tx,
+                    sessions,
+                    duplicated_commands,
                     ..
                 } => {
                     heartbeats_received.insert(header.source);
@@ -380,17 +363,12 @@ impl Raft {
                             if let Some(next_index_val) = next_index.get_mut(&header.source) {
                                 *next_index_val =
                                     u64::try_from(args.last_verified_log_index).unwrap() + 1;
-                                    debug!("next_index_val: {}", next_index_val);
                             }
                             if let Some(match_index_val) = match_index.get_mut(&header.source) {
                                 *match_index_val = args.last_verified_log_index.try_into().unwrap();
-                                debug!("match_index_val: {}", match_index_val);
                             }
-                            for new_commit_index in
-                                self.commit_index..=args.last_verified_log_index
+                            for new_commit_index in self.commit_index..=args.last_verified_log_index
                             {
-                                debug!("check new_commit_index: {}", new_commit_index);
-                                // TODO: check if not counting self twice
                                 let mut count = 1;
                                 for (_, match_index) in match_index.iter() {
                                     if *match_index >= new_commit_index.try_into().unwrap() {
@@ -412,9 +390,9 @@ impl Raft {
                             }
                             // Uuid::from_u128(self.pstate.log().len() as u128)
                             while self.last_applied <= self.commit_index {
-                                debug!("Applying log at {:?}", self.last_applied);
                                 match self.pstate.log().get(self.last_applied) {
                                     Some(LogEntry {
+                                        timestamp,
                                         content:
                                             LogEntryContent::Command {
                                                 data,
@@ -424,37 +402,109 @@ impl Raft {
                                             },
                                         ..
                                     }) => {
-                                        info!("Committing command by leader");
-                                        let output = self.state_machine.apply(data).await;
+                                        debug!("Committing command by leader");
                                         if let Some(tx) = client_id2tx.get(client_id) {
-                                            if let Err(e) = tx
-                                                .send(ClientRequestResponse::CommandResponse(
-                                                    CommandResponseArgs {
-                                                        content:
-                                                            CommandResponseContent::CommandApplied {
-                                                                output,
+                                            match sessions.get_mut(client_id) {
+                                                Some(session)
+                                                    if session.last_activity.elapsed().unwrap()
+                                                        < self.config.session_expiration
+                                                        && session
+                                                            .lowest_sequence_num_without_response
+                                                            <= *sequence_num =>
+                                                {
+                                                    let output_to_send = match session
+                                                        .responses
+                                                        .get(sequence_num)
+                                                    {
+                                                        Some(response) => {
+                                                            error!("Sending response from session");
+                                                            response.clone()
+                                                        }
+                                                        None => {
+                                                            debug!("Sending response from state machine");
+                                                            error!("Store response in session seq: {} client: {}", sequence_num, client_id);
+                                                            let output = self
+                                                            .state_machine
+                                                            .apply(data)
+                                                            .await;
+                                                            session.responses.insert(
+                                                                *sequence_num,
+                                                                output.clone(),
+                                                            );
+                                                            error!("duplication: {:?}", session.responses);
+                                                            output
+                                                        }
+                                                    };
+                                                    let n_duplicates = duplicated_commands.remove(&(
+                                                        *client_id,
+                                                        *sequence_num,
+                                                    )).unwrap();
+                                                    for _ in 0..n_duplicates {
+                                                        
+                                                        if let Err(e) = tx
+                                                        .send(ClientRequestResponse::CommandResponse(
+                                                            CommandResponseArgs {
+                                                                content:
+                                                                CommandResponseContent::CommandApplied {
+                                                                    output: output_to_send.clone(),
+                                                                },
+                                                                client_id: *client_id,
+                                                                sequence_num: *sequence_num,
                                                             },
-                                                        client_id: *client_id,
-                                                        sequence_num: *sequence_num,
-                                                    },
-                                                ))
-                                                .await
-                                            {
-                                                debug!(
-                                                    "Failed to send command response to client: {}",
-                                                    e
-                                                );
+                                                        ))
+                                                        .await
+                                                        
+                                                        {
+                                                            debug!(
+                                                                "Failed to send command response to client: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    session.last_activity = *timestamp;
+                                                }
+                                                _ => {
+                                                    debug!("Client session expired");
+                                                    sessions.remove(client_id);
+                                                    if let Err(e) = tx
+                                                        .send(ClientRequestResponse::CommandResponse(
+                                                            CommandResponseArgs {
+                                                                content:
+                                                                    CommandResponseContent::SessionExpired,
+                                                                client_id: *client_id,
+                                                                sequence_num: *sequence_num,
+                                                            },
+                                                        ))
+                                                        .await
+                                                    {
+                                                        debug!(
+                                                            "Failed to send command response to client: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
                                             }
+                                        } else {
+                                            self.state_machine.apply(data).await;
                                         }
                                         self.last_applied += 1;
                                     }
                                     Some(LogEntry {
+                                        timestamp,
                                         content: LogEntryContent::RegisterClient,
                                         ..
                                     }) => {
-                                        info!("Committing register client by leader");
+                                        debug!("Committing register client by leader");
                                         let client_id = Uuid::from_u128(self.last_applied as u128);
                                         if let Some(tx) = client_id2tx.get(&client_id) {
+                                            sessions.insert(
+                                                client_id,
+                                                ClientSession {
+                                                    last_activity: *timestamp,
+                                                    responses: HashMap::new(),
+                                                    lowest_sequence_num_without_response: 0,
+                                                },
+                                            );
                                             if let Err(e) = tx.send(ClientRequestResponse::RegisterClientResponse(RegisterClientResponseArgs {
                                             content: RegisterClientResponseContent::ClientRegistered { client_id }
                                         })).await {
@@ -472,7 +522,6 @@ impl Raft {
                             }
                         }
                     }
-                    info!("Leader last applied: {}", self.last_applied);
                 }
                 _ => {}
             }
@@ -496,12 +545,14 @@ impl Raft {
                 .config
                 .servers
                 .iter()
-                .map(|uid| (*uid, (self.pstate.log().len()-1).try_into().unwrap()))
+                .map(|uid| (*uid, (self.pstate.log().len() - 1).try_into().unwrap()))
                 .collect(),
             match_index: self.config.servers.iter().map(|uid| (*uid, 0)).collect(),
             heartbeats_received: HashSet::from([self.config.self_id]),
             last_hearbeat_round_successful: true,
             client_id2tx: HashMap::new(),
+            sessions: HashMap::new(),
+            duplicated_commands: HashMap::new(),
         };
         self.self_ref
             .as_ref()
@@ -539,8 +590,6 @@ impl Handler<RaftMessage> for Raft {
             _ => unimplemented!(),
         };
 
-        debug!("Reply content: {:?} to {}", reply_content, msg.header.source);
-
         if let Some(content) = reply_content {
             self.message_sender
                 .send(
@@ -568,20 +617,95 @@ impl Handler<ClientRequest> for Raft {
                 sequence_num,
                 lowest_sequence_num_without_response,
             } => match &mut self.process_type {
-                ProcessType::Leader { client_id2tx, .. } => {
-                    self.pstate
-                        .append_log(LogEntry {
-                            term: self.pstate.current_term(),
-                            timestamp: SystemTime::now(),
-                            content: LogEntryContent::Command {
-                                data: command,
-                                client_id,
-                                sequence_num,
+                ProcessType::Leader {
+                    client_id2tx,
+                    sessions,
+                    duplicated_commands,
+                    ..
+                } => {
+                    if let Some(client_session) = sessions.get_mut(&client_id) {
+                        if client_session.last_activity.elapsed().unwrap()
+                            > self.config.session_expiration
+                            || sequence_num < client_session.lowest_sequence_num_without_response
+                        {
+                            info!("Session expired");
+                            info!("New command with sequence_num: {}, lowest_sequence_num_without_response: {} ", sequence_num, client_session.lowest_sequence_num_without_response);
+                            // sessions.remove(&client_id);
+                            if let Err(e) = msg
+                                .reply_to
+                                .send(ClientRequestResponse::CommandResponse(
+                                    CommandResponseArgs {
+                                        client_id,
+                                        sequence_num,
+                                        content: CommandResponseContent::SessionExpired,
+                                    },
+                                ))
+                                .await
+                            {
+                                error!("Failed to send command response to client: {}", e);
+                            };
+                            return;
+                        } else {
+                            client_session.lowest_sequence_num_without_response = max(
                                 lowest_sequence_num_without_response,
-                            },
-                        })
-                        .await;
-                    client_id2tx.insert(client_id, msg.reply_to);
+                                client_session.lowest_sequence_num_without_response,
+                            );
+                            error!("stored commands: {:?}", client_session.responses);
+                            if let Some(responses) = client_session.responses.get(&sequence_num) {
+                                error!("Duplicated command: {} {}", client_id, sequence_num);
+                                return if let Err(e) = msg
+                                    .reply_to
+                                    .send(ClientRequestResponse::CommandResponse(
+                                        CommandResponseArgs {
+                                            client_id,
+                                            sequence_num,
+                                            content: CommandResponseContent::CommandApplied {
+                                                output: responses.clone(),
+                                            },
+                                        },
+                                    ))
+                                    .await
+                                {
+                                    error!("Failed to send command response to client: {}", e);
+                                };
+                            } else {
+                                if let Some(duplicated_command) =
+                                    duplicated_commands.get_mut(&(client_id, sequence_num))
+                                {
+                                    *duplicated_command += 1;
+                                } else {
+                                    duplicated_commands.insert((client_id, sequence_num), 1);
+                                    self.pstate
+                                        .append_log(LogEntry {
+                                            term: self.pstate.current_term(),
+                                            timestamp: SystemTime::now(),
+                                            content: LogEntryContent::Command {
+                                                data: command,
+                                                client_id,
+                                                sequence_num,
+                                                lowest_sequence_num_without_response: client_session.lowest_sequence_num_without_response,
+                                            },
+                                        })
+                                        .await;
+                                }
+                                client_id2tx.insert(client_id, msg.reply_to);
+                            }
+                        }
+                    } else {
+                        if let Err(e) = msg
+                            .reply_to
+                            .send(ClientRequestResponse::CommandResponse(
+                                CommandResponseArgs {
+                                    client_id,
+                                    sequence_num,
+                                    content: CommandResponseContent::SessionExpired,
+                                },
+                            ))
+                            .await
+                        {
+                            error!("Failed to send command response to client: {}", e);
+                        };
+                    }
                 }
                 _ => {
                     if let Err(e) = msg
@@ -664,7 +788,6 @@ impl Handler<ElectionTimeout> for Raft {
                 self.current_leader = None;
                 return;
             } else {
-                debug!("Leader heartbeat round successful, leader continues");
                 *last_hearbeat_round_successful = false;
                 return;
             }
@@ -702,7 +825,6 @@ impl Handler<ElectionTimeout> for Raft {
 #[async_trait::async_trait]
 impl Handler<HeartbeatTimeout> for Raft {
     async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: HeartbeatTimeout) {
-        debug!("Heartbeat timeout received ,my id is: {:?}, my logs are: {:?}",  self.config.self_id, self.pstate.log());
         if let ProcessType::Leader {
             heartbeats_received,
             last_hearbeat_round_successful,
@@ -716,7 +838,6 @@ impl Handler<HeartbeatTimeout> for Raft {
                 (HeartbeatTimeout::First, _) => true,
                 (HeartbeatTimeout::NotFirst, val) => val,
             };
-            debug!("New last_hearbeat_round_successful: {:?}", last_hearbeat_round_successful);
             heartbeats_received.clear();
             heartbeats_received.insert(self.config.self_id);
             self.send_append_entries(None).await;

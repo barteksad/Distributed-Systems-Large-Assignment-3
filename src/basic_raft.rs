@@ -4,7 +4,7 @@ use async_channel::Sender;
 use log::debug;
 use uuid::Uuid;
 
-use crate::{LogEntry, LogEntryContent, ServerConfig, StableStorage, ClientRequestResponse};
+use crate::{LogEntry, LogEntryContent, ServerConfig, StableStorage, ClientRequestResponse, ClientSession};
 
 pub struct PersistentState {
     current_term: u64,
@@ -36,6 +36,8 @@ pub enum ProcessType {
         heartbeats_received: HashSet<Uuid>,
         last_hearbeat_round_successful: bool,
         client_id2tx: HashMap<Uuid, Sender<ClientRequestResponse>>,
+        sessions: HashMap<Uuid, ClientSession>,
+        duplicated_commands: HashMap<(Uuid, u64), usize>,
     },
 }
 
