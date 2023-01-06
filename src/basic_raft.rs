@@ -66,9 +66,13 @@ impl PersistentState {
         loop {
             let log = stable_storage.get(&format!("log_{}", idx)).await;
             match log {
-                Some(log) => {
-                    logs.push(bincode::deserialize(&log).unwrap());
-                    idx += 1;
+                Some(maybe_log) => {
+                    if let Some(log) = bincode::deserialize(&maybe_log).unwrap() {
+                        logs.push(log);
+                        idx += 1;
+                    } else {
+                        break;
+                    }
                 }
                 None => break,
             }
@@ -117,13 +121,17 @@ impl PersistentState {
     pub async fn append_log(&mut self, log: LogEntry) {
         let next_idx = self.log.len();
         self.stable_storage
-            .put(&format!("log_{}", next_idx), &bincode::serialize(&log).unwrap())
+            .put(&format!("log_{}", next_idx), &bincode::serialize(&Some(log.clone())).unwrap())
             .await
             .unwrap();
         self.log.push(log);
     }
 
     pub async fn delete_logs_from(&mut self, idx: usize) {
+        self.stable_storage
+            .put(&format!("log_{}", idx), &bincode::serialize::<Option<LogEntry>>(&None).unwrap())
+            .await
+            .unwrap();
         self.log.truncate(idx);
     }
 }

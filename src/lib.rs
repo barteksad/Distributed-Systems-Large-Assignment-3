@@ -453,7 +453,7 @@ impl Raft {
                                         ..
                                     }) => {
                                         info!("Committing register client by leader");
-                                        let client_id = Uuid::from_u128((self.last_applied + 1) as u128);
+                                        let client_id = Uuid::from_u128(self.last_applied as u128);
                                         if let Some(tx) = client_id2tx.get(&client_id) {
                                             if let Err(e) = tx.send(ClientRequestResponse::RegisterClientResponse(RegisterClientResponseArgs {
                                             content: RegisterClientResponseContent::ClientRegistered { client_id }
@@ -618,7 +618,7 @@ impl Handler<ClientRequest> for Raft {
                         })
                         .await;
                     client_id2tx.insert(
-                        Uuid::from_u128(self.pstate.log().len() as u128),
+                        Uuid::from_u128((self.pstate.log().len() - 1) as u128),
                         msg.reply_to,
                     );
                 }
