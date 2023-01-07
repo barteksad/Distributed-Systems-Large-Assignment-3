@@ -147,7 +147,7 @@ impl Raft {
 
                 // Used after receiving successful AppendEntries response
                 if target_one.is_some() && entries.is_empty() {
-                    continue;
+                    break;
                 }
 
                 let msg = RaftMessage {
@@ -348,46 +348,42 @@ impl Raft {
                                 },
                             ..
                         }) => {
-                            debug!("Committing command by leader");
                             if let Some(tx) = client_id2tx.get(client_id) {
                                 match sessions.get_mut(client_id) {
                                     Some(session)
-                                    if session.last_activity.elapsed().unwrap()
-                                    < self.config.session_expiration
-                                    && session.lowest_sequence_num_without_response
-                                    <= *sequence_num =>
+                                        if session.last_activity.elapsed().unwrap()
+                                            < self.config.session_expiration
+                                            && session.lowest_sequence_num_without_response
+                                                <= *sequence_num =>
                                     {
-                                        debug!("lowest_sequence_num_without_response: {}, session lowest_sequence_num_without_response {}", lowest_sequence_num_without_response, session.lowest_sequence_num_without_response);
                                         session.lowest_sequence_num_without_response = max(
                                             *lowest_sequence_num_without_response,
                                             session.lowest_sequence_num_without_response,
                                         );
-                                        let output_to_send = match session
-                                            .responses
-                                            .get(sequence_num)
-                                        {
-                                            Some(response) => {
-                                                error!("Sending response from session");
-                                                response.clone()
-                                            }
-                                            None => {
-                                                debug!("Sending response from state machine");
-                                                error!(
+                                        let output_to_send =
+                                            match session.responses.get(sequence_num) {
+                                                Some(response) => {
+                                                    error!("Sending response from session");
+                                                    response.clone()
+                                                }
+                                                None => {
+                                                    debug!("Sending response from state machine");
+                                                    error!(
                                                     "Store response in session seq: {} client: {}",
                                                     sequence_num, client_id
                                                 );
-                                                let output = self.state_machine.apply(data).await;
-                                                session
-                                                    .responses
-                                                    .insert(*sequence_num, output.clone());
-                                                error!("duplication: {:?}", session.responses);
-                                                output
-                                            }
-                                        };
+                                                    let output =
+                                                        self.state_machine.apply(data).await;
+                                                    session
+                                                        .responses
+                                                        .insert(*sequence_num, output.clone());
+                                                    error!("duplication: {:?}", session.responses);
+                                                    output
+                                                }
+                                            };
                                         let n_duplicates = duplicated_commands
                                             .remove(&(*client_id, *sequence_num))
                                             .unwrap();
-                                        debug!("n_duplicates: {}", n_duplicates);
                                         for _ in 0..n_duplicates {
                                             if let Err(e) = tx
                                                 .send(ClientRequestResponse::CommandResponse(
@@ -413,7 +409,6 @@ impl Raft {
                                     _ => {
                                         self.state_machine.apply(data).await;
                                         debug!("Client session expired");
-                                        // sessions.remove(client_id);
                                         if let Err(e) = tx
                                             .send(ClientRequestResponse::CommandResponse(
                                                 CommandResponseArgs {
@@ -646,79 +641,31 @@ impl Handler<ClientRequest> for Raft {
                     ..
                 } => {
                     if let Some(client_session) = sessions.get_mut(&client_id) {
-                        // if client_session.last_activity.elapsed().unwrap()
-                        //     > self.config.session_expiration
-                        //     || sequence_num < client_session.lowest_sequence_num_without_response
-                        // {
-                        // info!("Session expired");
-                        // info!("New command with sequence_num: {}, lowest_sequence_num_without_response: {} ", sequence_num, client_session.lowest_sequence_num_without_response);
-                        // // sessions.remove(&client_id);
-                        // if let Err(e) = msg
-                        //     .reply_to
-                        //     .send(ClientRequestResponse::CommandResponse(
-                        //         CommandResponseArgs {
-                        //             client_id,
-                        //             sequence_num,
-                        //             content: CommandResponseContent::SessionExpired,
-                        //         },
-                        //     ))
-                        //     .await
-                        // {
-                        //     error!("Failed to send command response to client: {}", e);
-                        // };
-                        // return;
-                        // } else {
-                        // client_session.lowest_sequence_num_without_response = max(
-                        //     lowest_sequence_num_without_response,
-                        //     client_session.lowest_sequence_num_without_response,
-                        // );
-                        error!("new content: {:?} {:?} {:?} {:?}", command, client_id, sequence_num, lowest_sequence_num_without_response);
-                        error!("stored commands: {:?}", client_session.responses);
-                        // if let Some(responses) = client_session.responses.get(&sequence_num) {
-                        //     error!("Duplicated command: {} {}", client_id, sequence_num);
-                        //     return if let Err(e) = msg
-                        //         .reply_to
-                        //         .send(ClientRequestResponse::CommandResponse(
-                        //             CommandResponseArgs {
-                        //                 client_id,
-                        //                 sequence_num,
-                        //                 content: CommandResponseContent::CommandApplied {
-                        //                     output: responses.clone(),
-                        //                 },
-                        //             },
-                        //         ))
-                        //         .await
-                        //     {
-                        //         error!("Failed to send command response to client: {}", e);
-                        //     };
-                        // } else {
-                            if let Some(duplicated_command) =
-                                duplicated_commands.get_mut(&(client_id, sequence_num))
-                            {
-                                *duplicated_command += 1;
-                            } else {
-                                duplicated_commands.insert((client_id, sequence_num), 1);
-                                self.pstate
-                                    .append_log(LogEntry {
-                                        term: self.pstate.current_term(),
-                                        timestamp: SystemTime::now(),
-                                        content: LogEntryContent::Command {
-                                            data: command,
-                                            client_id,
-                                            sequence_num,
-                                            lowest_sequence_num_without_response,
-                                        },
-                                    })
-                                    .await;
-                            }
-                            client_id2tx.insert(client_id, msg.reply_to);
+                        if let Some(duplicated_command) =
+                            duplicated_commands.get_mut(&(client_id, sequence_num))
+                        {
+                            *duplicated_command += 1;
+                        } else {
+                            duplicated_commands.insert((client_id, sequence_num), 1);
+                            self.pstate
+                                .append_log(LogEntry {
+                                    term: self.pstate.current_term(),
+                                    timestamp: SystemTime::now(),
+                                    content: LogEntryContent::Command {
+                                        data: command,
+                                        client_id,
+                                        sequence_num,
+                                        lowest_sequence_num_without_response,
+                                    },
+                                })
+                                .await;
+                        }
+                        client_id2tx.insert(client_id, msg.reply_to);
 
-                            if self.config.servers.len() == 1 {
-                                self.commit_index += 1;
-                                self.apply_logs_leader().await;
-                            }
-                        // }
-                        // }
+                        if self.config.servers.len() == 1 {
+                            self.commit_index += 1;
+                            self.apply_logs_leader().await;
+                        }
                     } else {
                         if let Err(e) = msg
                             .reply_to
