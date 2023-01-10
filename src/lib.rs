@@ -8,7 +8,7 @@ use basic_raft::{ElectionTimeout, HeartbeatTimeout, Init, PersistentState, Proce
 use executor::{Handler, ModuleRef, System, TimerHandle};
 
 pub use domain::*;
-use log::{debug, error, info};
+use log::{debug, error};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -175,19 +175,18 @@ impl Raft {
         header: &RaftMessageHeader,
         args: RequestVoteArgs,
     ) -> Option<RaftMessageContent> {
-
         if let ProcessType::Leader { .. } = self.process_type {
             return None;
         }
-        
+
         if let Some(timestamp) = self.last_leader_timestamp {
             if timestamp.elapsed().unwrap() <= *self.config.election_timeout_range.start() {
                 return None;
             }
         }
-        
+
         self.common_raft_message_handle(header).await;
-        
+
         let vote_granted = match (
             header.term < self.pstate.current_term(),
             self.pstate.voted_for(),
@@ -201,9 +200,6 @@ impl Raft {
                     || (args.last_log_term == last_log_term
                         && args.last_log_index >= last_log_index)
                 {
-                    if let ProcessType::Follower { start_election } = &mut self.process_type {
-                        *start_election = false;
-                    };
                     true
                 } else {
                     false
@@ -214,6 +210,7 @@ impl Raft {
 
         match vote_granted {
             true => {
+                self.reset_election_timer().await;
                 self.pstate.set_voted_for(Some(header.source)).await;
                 Some(RaftMessageContent::RequestVoteResponse(
                     RequestVoteResponseArgs { vote_granted: true },
@@ -222,7 +219,7 @@ impl Raft {
             false => Some(RaftMessageContent::RequestVoteResponse(
                 RequestVoteResponseArgs {
                     vote_granted: false,
-                }
+                },
             )),
         }
     }
@@ -477,61 +474,57 @@ impl Raft {
         args: AppendEntriesResponseArgs,
     ) -> Option<RaftMessageContent> {
         self.common_raft_message_handle(header).await;
-            match &mut self.process_type {
-                ProcessType::Leader {
-                    next_index,
-                    match_index,
-                    heartbeats_received,
-                    client_id2tx,
-                    sessions,
-                    duplicated_commands,
-                    ..
-                } => {
-                    heartbeats_received.insert(header.source);
-                    match args.success {
-                        false => {
-                            if let Some(next_index_val) = next_index.get_mut(&header.source) {
-                                if next_index_val > &mut 0 {
-                                    *next_index_val -= 1;
-                                }
+        match &mut self.process_type {
+            ProcessType::Leader {
+                next_index,
+                match_index,
+                heartbeats_received,
+                ..
+            } => {
+                heartbeats_received.insert(header.source);
+                match args.success {
+                    false => {
+                        if let Some(next_index_val) = next_index.get_mut(&header.source) {
+                            if next_index_val > &mut 0 {
+                                *next_index_val -= 1;
                             }
-                            self.send_append_entries(Some(header.source)).await;
                         }
-                        true => {
-                            if let Some(next_index_val) = next_index.get_mut(&header.source) {
-                                *next_index_val =
-                                    u64::try_from(args.last_verified_log_index).unwrap() + 1;
-                            }
-                            if let Some(match_index_val) = match_index.get_mut(&header.source) {
-                                *match_index_val = args.last_verified_log_index.try_into().unwrap();
-                            }
-                            for new_commit_index in self.commit_index..=args.last_verified_log_index
-                            {
-                                let mut count = 1;
-                                for (_, match_index) in match_index.iter() {
-                                    if *match_index >= new_commit_index.try_into().unwrap() {
-                                        count += 1;
-                                    }
+                        self.send_append_entries(Some(header.source)).await;
+                    }
+                    true => {
+                        if let Some(next_index_val) = next_index.get_mut(&header.source) {
+                            *next_index_val =
+                                u64::try_from(args.last_verified_log_index).unwrap() + 1;
+                        }
+                        if let Some(match_index_val) = match_index.get_mut(&header.source) {
+                            *match_index_val = args.last_verified_log_index.try_into().unwrap();
+                        }
+                        for new_commit_index in self.commit_index..=args.last_verified_log_index {
+                            let mut count = 1;
+                            for (_, match_index) in match_index.iter() {
+                                if *match_index >= new_commit_index.try_into().unwrap() {
+                                    count += 1;
                                 }
-                                if 2 * count > self.config.servers.len() {
-                                    match self.pstate.log().get(new_commit_index) {
-                                        Some(LogEntry { term, .. }) => {
-                                            if term == &self.pstate.current_term() {
-                                                self.commit_index = new_commit_index;
-                                            }
+                            }
+                            if 2 * count > self.config.servers.len() {
+                                match self.pstate.log().get(new_commit_index) {
+                                    Some(LogEntry { term, .. }) => {
+                                        if term == &self.pstate.current_term() {
+                                            self.commit_index = new_commit_index;
                                         }
-                                        None => break,
                                     }
-                                } else {
-                                    break;
+                                    None => break,
                                 }
+                            } else {
+                                break;
                             }
-                            self.apply_logs_leader().await;
                         }
+                        self.apply_logs_leader().await;
                     }
                 }
-                _ => {}
             }
+            _ => {}
+        }
         // }
         None
     }
@@ -574,7 +567,7 @@ impl Raft {
     async fn common_raft_message_handle(&mut self, header: &RaftMessageHeader) {
         if header.term > self.pstate.current_term() {
             self.update_term(header.term).await;
-            self.process_type = ProcessType::Follower { start_election: true };
+            self.process_type = ProcessType::Follower;
             self.pstate.set_voted_for(None).await;
             self.last_leader_timestamp = None;
             self.current_leader = None;
@@ -639,7 +632,7 @@ impl Handler<ClientRequest> for Raft {
                     duplicated_commands,
                     ..
                 } => {
-                    if let Some(client_session) = sessions.get_mut(&client_id) {
+                    if sessions.contains_key(&client_id) {
                         if let Some(duplicated_command) =
                             duplicated_commands.get_mut(&(client_id, sequence_num))
                         {
@@ -759,14 +752,10 @@ impl Handler<ElectionTimeout> for Raft {
                     self.process_type = ProcessType::default();
                     self.last_leader_timestamp = None;
                     self.heartbeat_timer_handle.take().unwrap().stop().await;
-                    self.current_leader = None;            
+                    self.current_leader = None;
                 }
                 return;
-            },
-            ProcessType::Follower { start_election } if !*start_election => {
-                *start_election = true;
-                return;
-            },
+            }
             _ => {
                 self.reset_election_timer().await;
                 self.update_term(self.pstate.current_term() + 1).await;
@@ -774,7 +763,7 @@ impl Handler<ElectionTimeout> for Raft {
                 self.process_type = ProcessType::Candidate {
                     votes_received: HashSet::from([self.config.self_id]),
                 };
-        
+
                 if self.config.servers.len() == 1 {
                     self.become_leader().await;
                 } else {
@@ -789,7 +778,7 @@ impl Handler<ElectionTimeout> for Raft {
                             last_log_term: logs.last().map(|e| e.term).unwrap(),
                         }),
                     };
-        
+
                     for server in &self.config.servers {
                         if *server != self.config.self_id {
                             self.message_sender.send(server, msg.clone()).await;
@@ -803,14 +792,15 @@ impl Handler<ElectionTimeout> for Raft {
 
 #[async_trait::async_trait]
 impl Handler<HeartbeatTimeout> for Raft {
-    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, msg: HeartbeatTimeout) {
+    async fn handle(&mut self, _self_ref: &ModuleRef<Self>, _msg: HeartbeatTimeout) {
         if let ProcessType::Leader {
             heartbeats_received,
             last_hearbeat_round_successful,
             ..
         } = &mut self.process_type
         {
-            *last_hearbeat_round_successful = 2 * heartbeats_received.len() > self.config.servers.len();
+            *last_hearbeat_round_successful =
+                2 * heartbeats_received.len() > self.config.servers.len();
             heartbeats_received.clear();
             heartbeats_received.insert(self.config.self_id);
             self.send_append_entries(None).await;
