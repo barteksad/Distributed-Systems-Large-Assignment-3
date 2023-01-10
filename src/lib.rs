@@ -67,6 +67,7 @@ impl Raft {
         self.pstate.set_current_term(new_term).await;
         self.pstate.set_voted_for(None).await;
         self.current_leader = None;
+        self.last_leader_timestamp = None;
     }
 
     async fn reset_election_timer(&mut self) {
@@ -174,21 +175,19 @@ impl Raft {
         header: &RaftMessageHeader,
         args: RequestVoteArgs,
     ) -> Option<RaftMessageContent> {
-        // (Chapter 4.2.3 of [1])
+
+        if let ProcessType::Leader { .. } = self.process_type {
+            return None;
+        }
+        
         if let Some(timestamp) = self.last_leader_timestamp {
             if timestamp.elapsed().unwrap() <= *self.config.election_timeout_range.start() {
                 return None;
             }
         }
-
-        if let ProcessType::Leader { .. } = self.process_type {
-            return None;
-        }
-
-        if header.term > self.pstate.current_term() {
-            self.update_term(header.term).await;
-        }
-
+        
+        self.common_raft_message_handle(header).await;
+        
         let vote_granted = match (
             header.term < self.pstate.current_term(),
             self.pstate.voted_for(),
@@ -202,6 +201,9 @@ impl Raft {
                     || (args.last_log_term == last_log_term
                         && args.last_log_index >= last_log_index)
                 {
+                    if let ProcessType::Follower { start_election } = &mut self.process_type {
+                        *start_election = false;
+                    };
                     true
                 } else {
                     false
@@ -212,9 +214,7 @@ impl Raft {
 
         match vote_granted {
             true => {
-                self.reset_election_timer().await;
                 self.pstate.set_voted_for(Some(header.source)).await;
-
                 Some(RaftMessageContent::RequestVoteResponse(
                     RequestVoteResponseArgs { vote_granted: true },
                 ))
@@ -222,7 +222,7 @@ impl Raft {
             false => Some(RaftMessageContent::RequestVoteResponse(
                 RequestVoteResponseArgs {
                     vote_granted: false,
-                },
+                }
             )),
         }
     }
@@ -232,14 +232,12 @@ impl Raft {
         header: &RaftMessageHeader,
         args: RequestVoteResponseArgs,
     ) {
+        self.common_raft_message_handle(header).await;
         match &mut self.process_type {
-            ProcessType::Follower => return,
+            ProcessType::Follower { .. } => return,
             ProcessType::Leader { .. } => return,
             ProcessType::Candidate { votes_received } => {
-                if header.term > self.pstate.current_term() {
-                    self.update_term(header.term).await;
-                    self.process_type = ProcessType::Follower;
-                } else if args.vote_granted {
+                if args.vote_granted {
                     votes_received.insert(header.source);
                     if 2 * votes_received.len() > self.config.servers.len() {
                         self.become_leader().await;
@@ -254,6 +252,7 @@ impl Raft {
         header: &RaftMessageHeader,
         args: AppendEntriesArgs,
     ) -> Option<RaftMessageContent> {
+        self.common_raft_message_handle(header).await;
         if header.term < self.pstate.current_term() {
             // self.update_term(header.term).await;
             Some(RaftMessageContent::AppendEntriesResponse(
@@ -263,13 +262,10 @@ impl Raft {
                 },
             ))
         } else {
-            if header.term > self.pstate.current_term() {
-                self.update_term(header.term).await;
-            }
+            // self.process_type = ProcessType::Follower { start_election: false };
             self.reset_election_timer().await;
             self.current_leader = Some(header.source);
             self.last_leader_timestamp = Some(SystemTime::now());
-            self.process_type = ProcessType::Follower;
             if let Some(timer_handle) = self.heartbeat_timer_handle.take() {
                 timer_handle.stop().await;
             }
@@ -480,13 +476,7 @@ impl Raft {
         header: &RaftMessageHeader,
         args: AppendEntriesResponseArgs,
     ) -> Option<RaftMessageContent> {
-        if header.term > self.pstate.current_term() {
-            self.update_term(header.term).await;
-            self.process_type = ProcessType::Follower;
-            if let Some(timer_handle) = self.heartbeat_timer_handle.take() {
-                timer_handle.stop().await;
-            }
-        } else {
+        self.common_raft_message_handle(header).await;
             match &mut self.process_type {
                 ProcessType::Leader {
                     next_index,
@@ -542,7 +532,7 @@ impl Raft {
                 }
                 _ => {}
             }
-        }
+        // }
         None
     }
 
@@ -571,18 +561,27 @@ impl Raft {
             sessions: HashMap::new(),
             duplicated_commands: HashMap::new(),
         };
-        self.self_ref
-            .as_ref()
-            .unwrap()
-            .send(HeartbeatTimeout::First)
-            .await;
+        self.send_append_entries(None).await;
         self.heartbeat_timer_handle = Some(
             self.self_ref
                 .as_ref()
                 .unwrap()
-                .request_tick(HeartbeatTimeout::NotFirst, self.config.heartbeat_timeout)
+                .request_tick(HeartbeatTimeout, self.config.heartbeat_timeout)
                 .await,
         );
+    }
+
+    async fn common_raft_message_handle(&mut self, header: &RaftMessageHeader) {
+        if header.term > self.pstate.current_term() {
+            self.update_term(header.term).await;
+            self.process_type = ProcessType::Follower { start_election: true };
+            self.pstate.set_voted_for(None).await;
+            self.last_leader_timestamp = None;
+            self.current_leader = None;
+            if let Some(timer_handle) = self.heartbeat_timer_handle.take() {
+                timer_handle.stop().await;
+            }
+        }
     }
 }
 
@@ -751,46 +750,51 @@ impl Handler<Init> for Raft {
 #[async_trait::async_trait]
 impl Handler<ElectionTimeout> for Raft {
     async fn handle(&mut self, _self_ref: &ModuleRef<Self>, _msg: ElectionTimeout) {
-        if let ProcessType::Leader {
-            last_hearbeat_round_successful,
-            ..
-        } = &mut self.process_type
-        {
-            if !*last_hearbeat_round_successful {
-                debug!("Leader heartbeat round not successful!, leader steps down");
-                self.process_type = ProcessType::Follower;
-                self.heartbeat_timer_handle.take().unwrap().stop().await;
-                self.current_leader = None;
+        match &mut self.process_type {
+            ProcessType::Leader {
+                last_hearbeat_round_successful,
+                ..
+            } => {
+                if !*last_hearbeat_round_successful {
+                    self.process_type = ProcessType::default();
+                    self.last_leader_timestamp = None;
+                    self.heartbeat_timer_handle.take().unwrap().stop().await;
+                    self.current_leader = None;            
+                }
                 return;
-            } else {
-                *last_hearbeat_round_successful = false;
+            },
+            ProcessType::Follower { start_election } if !*start_election => {
+                *start_election = true;
                 return;
-            }
-        }
-        self.update_term(self.pstate.current_term() + 1).await;
-        self.pstate.set_voted_for(Some(self.config.self_id)).await;
-        self.process_type = ProcessType::Candidate {
-            votes_received: HashSet::from([self.config.self_id]),
-        };
-
-        if self.config.servers.len() == 1 {
-            self.become_leader().await;
-        } else {
-            let logs = self.pstate.log();
-            let msg = RaftMessage {
-                header: RaftMessageHeader {
-                    source: self.config.self_id,
-                    term: self.pstate.current_term(),
-                },
-                content: RaftMessageContent::RequestVote(RequestVoteArgs {
-                    last_log_index: logs.len(),
-                    last_log_term: logs.last().map(|e| e.term).unwrap(),
-                }),
-            };
-
-            for server in &self.config.servers {
-                if *server != self.config.self_id {
-                    self.message_sender.send(server, msg.clone()).await;
+            },
+            _ => {
+                self.reset_election_timer().await;
+                self.update_term(self.pstate.current_term() + 1).await;
+                self.pstate.set_voted_for(Some(self.config.self_id)).await;
+                self.process_type = ProcessType::Candidate {
+                    votes_received: HashSet::from([self.config.self_id]),
+                };
+        
+                if self.config.servers.len() == 1 {
+                    self.become_leader().await;
+                } else {
+                    let logs = self.pstate.log();
+                    let msg = RaftMessage {
+                        header: RaftMessageHeader {
+                            source: self.config.self_id,
+                            term: self.pstate.current_term(),
+                        },
+                        content: RaftMessageContent::RequestVote(RequestVoteArgs {
+                            last_log_index: logs.len(),
+                            last_log_term: logs.last().map(|e| e.term).unwrap(),
+                        }),
+                    };
+        
+                    for server in &self.config.servers {
+                        if *server != self.config.self_id {
+                            self.message_sender.send(server, msg.clone()).await;
+                        }
+                    }
                 }
             }
         }
@@ -806,13 +810,7 @@ impl Handler<HeartbeatTimeout> for Raft {
             ..
         } = &mut self.process_type
         {
-            *last_hearbeat_round_successful = match (
-                msg,
-                2 * heartbeats_received.len() > self.config.servers.len(),
-            ) {
-                (HeartbeatTimeout::First, _) => true,
-                (HeartbeatTimeout::NotFirst, val) => val,
-            };
+            *last_hearbeat_round_successful = 2 * heartbeats_received.len() > self.config.servers.len();
             heartbeats_received.clear();
             heartbeats_received.insert(self.config.self_id);
             self.send_append_entries(None).await;

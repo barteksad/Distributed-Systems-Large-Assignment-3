@@ -17,10 +17,7 @@ pub struct PersistentState {
 pub struct ElectionTimeout;
 
 #[derive(Clone)]
-pub enum HeartbeatTimeout {
-    First,
-    NotFirst,
-}
+pub struct HeartbeatTimeout;
 
 #[derive(Clone)]
 pub struct Init;
@@ -28,7 +25,7 @@ pub struct Init;
 /// State of a Raft process with a corresponding (volatile) information.
 #[derive(Clone, Debug)]
 pub enum ProcessType {
-    Follower,
+    Follower { start_election: bool },
     Candidate { votes_received: HashSet<Uuid> },
     Leader { 
         next_index: HashMap<Uuid, u64>, 
@@ -43,7 +40,7 @@ pub enum ProcessType {
 
 impl Default for ProcessType {
     fn default() -> Self {
-        ProcessType::Follower
+        ProcessType::Follower { start_election: true }
     }
 }
 
