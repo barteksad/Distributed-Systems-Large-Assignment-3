@@ -127,10 +127,12 @@ impl PersistentState {
     }
 
     pub async fn delete_logs_from(&mut self, idx: usize) {
-        self.stable_storage
-            .put(&format!("log_{}", idx), &bincode::serialize::<Option<LogEntry>>(&None).unwrap())
+        for i in idx..self.log.len() {
+            self.stable_storage
+            .put(&format!("log_{}", i), &bincode::serialize::<Option<LogEntry>>(&None).unwrap())
             .await
             .unwrap();
+        }
         self.log.truncate(idx);
     }
 }
