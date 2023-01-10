@@ -4,7 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use basic_raft::{ElectionTimeout, HeartbeatTimeout, Init, PersistentState, ProcessType};
+use basic_raft::{ElectionTimeout, HeartbeatTimeout, Init, PersistentState, ProcessType, ClusterMembershipChangeProgress, ChangeProgress};
 use executor::{Handler, ModuleRef, System, TimerHandle};
 
 pub use domain::*;
@@ -545,6 +545,7 @@ impl Raft {
             client_id2tx: HashMap::new(),
             sessions: HashMap::new(),
             duplicated_commands: HashMap::new(),
+            cmcp: None,
         };
         if self.config.servers.len() == 1 {
             self.commit_index += 1;
@@ -571,6 +572,14 @@ impl Raft {
                 timer_handle.stop().await;
             }
         }
+    }
+
+    async fn start_cluster_membership_change(&mut self) {
+
+    }
+
+    async fn start_catch_up_rounds(&mut self, new_server_id: Uuid) {
+        
     }
 }
 
@@ -689,11 +698,108 @@ impl Handler<ClientRequest> for Raft {
                 }
             },
             ClientRequestContent::Snapshot => unimplemented!("Snapshots omitted"),
-            ClientRequestContent::AddServer { .. } => {
-                unimplemented!("Cluster membership changes omitted")
+            ClientRequestContent::AddServer { new_server } => {
+                let maybe_content= match &mut self.process_type {
+                    ProcessType::Leader { cmcp, .. } => {
+                        match (cmcp.is_some(), self.config.servers.contains(&new_server)) {
+                            (true, _) => Some(AddServerResponseContent::ChangeInProgress),
+                            (false, true) => Some(AddServerResponseContent::AlreadyPresent),
+                            (false, false) => {
+                                *cmcp = Some(ClusterMembershipChangeProgress {
+                                    id: new_server,
+                                    started: false,
+                                    finished_but_uncommited: false,
+                                    progress: ChangeProgress::AddServer(None)
+                                });
+                                match self.pstate.log().get(self.commit_index) {
+                                    Some(LogEntry {
+                                        term,
+                                        ..
+                                    })=> {
+                                        if *term >= self.pstate.current_term() {
+                                            self.start_cluster_membership_change().await;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                None
+                            }   
+                        }
+                    },
+                    _ => {
+                        debug!("Received add server request from client, but not leader");
+                        Some(AddServerResponseContent::NotLeader {
+                            leader_hint: self.current_leader,
+                        })
+                    }
+                };
+                
+                if let Some(content) = maybe_content {
+                    if let Err(e) = msg
+                    .reply_to
+                    .send(ClientRequestResponse::AddServerResponse(
+                        AddServerResponseArgs {
+                            new_server,
+                            content,
+                        },
+                    ))
+                    .await
+                    {
+                        debug!("Failed to send add server response to client: {}", e);
+                    }
+                }
             }
-            ClientRequestContent::RemoveServer { .. } => {
-                unimplemented!("Cluster membership changes omitted")
+            ClientRequestContent::RemoveServer { old_server } => {
+                let maybe_content= match &mut self.process_type {
+                    ProcessType::Leader { cmcp, .. } => {
+                        match (cmcp.is_some(), self.config.servers.contains(&old_server), self.config.servers.len()) {
+                            (true, _, _) => Some(RemoveServerResponseContent::ChangeInProgress),
+                            (false, false, _) => Some(RemoveServerResponseContent::NotPresent),
+                            (_, _, 1) => Some(RemoveServerResponseContent::OneServerLeft),
+                            (false, true, _) => {
+                                *cmcp = Some(ClusterMembershipChangeProgress {
+                                    id: old_server,
+                                    started: false,
+                                    finished_but_uncommited: false,
+                                    progress: ChangeProgress::RemoveServer,
+                                });
+                                match self.pstate.log().get(self.commit_index) {
+                                    Some(LogEntry {
+                                        term,
+                                        ..
+                                    })=> {
+                                        if *term >= self.pstate.current_term() {
+                                            self.start_cluster_membership_change().await;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                None
+                            }   
+                        }
+                    },
+                    _ => {
+                        debug!("Received add server request from client, but not leader");
+                        Some(RemoveServerResponseContent::NotLeader {
+                            leader_hint: self.current_leader,
+                        })
+                    }
+                };
+
+                if let Some(content) = maybe_content {
+                    if let Err(e) = msg
+                    .reply_to
+                    .send(ClientRequestResponse::RemoveServerResponse(
+                        RemoveServerResponseArgs {
+                            old_server,
+                            content,
+                        },
+                    ))
+                    .await
+                    {
+                        debug!("Failed to send add server response to client: {}", e);
+                    }
+                }
             }
             ClientRequestContent::RegisterClient => match &mut self.process_type {
                 ProcessType::Leader { client_id2tx, .. } => {

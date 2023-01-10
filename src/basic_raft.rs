@@ -35,6 +35,7 @@ pub enum ProcessType {
         client_id2tx: HashMap<Uuid, Sender<ClientRequestResponse>>,
         sessions: HashMap<Uuid, ClientSession>,
         duplicated_commands: HashMap<(Uuid, u64), usize>,
+        cmcp: Option<ClusterMembershipChangeProgress>,
     },
 }
 
@@ -42,6 +43,31 @@ impl Default for ProcessType {
     fn default() -> Self {
         ProcessType::Follower
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct ClusterMembershipChangeProgress {
+    pub id: Uuid,
+    pub started: bool,
+    pub finished_but_uncommited: bool,
+    pub progress: ChangeProgress,
+}
+
+#[derive(Clone, Debug)]
+pub enum ChangeProgress {
+    // sets when started
+    AddServer(Option<AddServerProgress>),
+    RemoveServer,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddServerProgress {
+    pub started: bool,
+    pub finished_but_uncommited: bool,
+    pub n_round: u64,
+    pub round_start_timestamp: SystemTime,
+    pub last_timestamp: SystemTime,
+    pub round_end_index: usize,
 }
 
 impl PersistentState {
