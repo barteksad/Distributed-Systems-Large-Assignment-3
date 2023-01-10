@@ -259,7 +259,7 @@ impl Raft {
                 },
             ))
         } else {
-            // self.process_type = ProcessType::Follower { start_election: false };
+            self.process_type = ProcessType::Follower;
             self.reset_election_timer().await;
             self.current_leader = Some(header.source);
             self.last_leader_timestamp = Some(SystemTime::now());
@@ -356,21 +356,14 @@ impl Raft {
                                         let output_to_send =
                                             match session.responses.get(sequence_num) {
                                                 Some(response) => {
-                                                    error!("Sending response from session");
                                                     response.clone()
                                                 }
                                                 None => {
-                                                    debug!("Sending response from state machine");
-                                                    error!(
-                                                    "Store response in session seq: {} client: {}",
-                                                    sequence_num, client_id
-                                                );
                                                     let output =
                                                         self.state_machine.apply(data).await;
                                                     session
                                                         .responses
                                                         .insert(*sequence_num, output.clone());
-                                                    error!("duplication: {:?}", session.responses);
                                                     output
                                                 }
                                             };
@@ -401,7 +394,6 @@ impl Raft {
                                     }
                                     _ => {
                                         self.state_machine.apply(data).await;
-                                        debug!("Client session expired");
                                         if let Err(e) = tx
                                             .send(ClientRequestResponse::CommandResponse(
                                                 CommandResponseArgs {
@@ -429,7 +421,6 @@ impl Raft {
                             content: LogEntryContent::RegisterClient,
                             ..
                         }) => {
-                            debug!("Committing register client by leader");
                             let client_id = Uuid::from_u128(self.last_applied as u128);
                             if let Some(tx) = client_id2tx.get(&client_id) {
                                 sessions.insert(
@@ -454,8 +445,7 @@ impl Raft {
                                     error!("Failed to send register response to client: {}", e);
                                 }
                             } else {
-                                error!("No tx for client_id: {}", client_id);
-                                panic!();
+                                panic!("No tx for client_id: {}", client_id);
                             }
                             self.last_applied += 1;
                         }
@@ -500,6 +490,7 @@ impl Raft {
                             *match_index_val = args.last_verified_log_index.try_into().unwrap();
                         }
                         for new_commit_index in self.commit_index..=args.last_verified_log_index {
+                            // One because self if not counted in match_index
                             let mut count = 1;
                             for (_, match_index) in match_index.iter() {
                                 if *match_index >= new_commit_index.try_into().unwrap() {
@@ -525,7 +516,6 @@ impl Raft {
             }
             _ => {}
         }
-        // }
         None
     }
 
@@ -541,19 +531,25 @@ impl Raft {
             })
             .await;
         self.process_type = ProcessType::Leader {
+            // Do not store value for self in next_index and match_index
             next_index: self
                 .config
                 .servers
                 .iter()
+                .filter(|&uuid| *uuid != self.config.self_id)
                 .map(|uid| (*uid, (self.pstate.log().len() - 1).try_into().unwrap()))
                 .collect(),
-            match_index: self.config.servers.iter().map(|uid| (*uid, 0)).collect(),
+            match_index: self.config.servers.iter().filter(|&uuid| *uuid != self.config.self_id).map(|uid| (*uid, 0)).collect(),
             heartbeats_received: HashSet::from([self.config.self_id]),
             last_hearbeat_round_successful: true,
             client_id2tx: HashMap::new(),
             sessions: HashMap::new(),
             duplicated_commands: HashMap::new(),
         };
+        if self.config.servers.len() == 1 {
+            self.commit_index += 1;
+            self.apply_logs_leader().await;
+        }
         self.send_append_entries(None).await;
         self.heartbeat_timer_handle = Some(
             self.self_ref
@@ -712,6 +708,10 @@ impl Handler<ClientRequest> for Raft {
                         Uuid::from_u128((self.pstate.log().len() - 1) as u128),
                         msg.reply_to,
                     );
+                    if self.config.servers.len() == 1 {
+                        self.commit_index += 1;
+                        self.apply_logs_leader().await;
+                    }
                 }
                 _ => {
                     msg.reply_to
