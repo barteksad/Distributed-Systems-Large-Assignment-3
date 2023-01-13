@@ -50,6 +50,7 @@ pub struct ClusterMembershipChangeProgress {
     pub id: Uuid,
     pub started: bool,
     pub finished_but_uncommited: bool,
+    pub client_tx: Sender<ClientRequestResponse>,
     pub progress: ChangeProgress,
 }
 
@@ -62,12 +63,10 @@ pub enum ChangeProgress {
 
 #[derive(Clone, Debug)]
 pub struct AddServerProgress {
-    pub started: bool,
-    pub finished_but_uncommited: bool,
     pub n_round: u64,
     pub round_start_timestamp: SystemTime,
     pub last_timestamp: SystemTime,
-    pub round_end_index: usize,
+    pub round_end_index: u64,
 }
 
 impl PersistentState {
@@ -160,5 +159,46 @@ impl PersistentState {
             .unwrap();
         }
         self.log.truncate(idx);
+    }
+}
+
+
+pub fn check_catch_up_timeout(
+    cmcp: &mut Option<ClusterMembershipChangeProgress>,
+    check_round_timeout: Option<bool>,
+    config: &ServerConfig,
+) -> bool {
+    match cmcp {
+        Some(ClusterMembershipChangeProgress {
+            progress:
+                ChangeProgress::AddServer(Some(AddServerProgress {
+                    n_round,
+                    round_start_timestamp,
+                    last_timestamp,
+                    round_end_index,
+                })),
+            finished_but_uncommited,
+            ..
+        }) if !*finished_but_uncommited => {
+            if last_timestamp.elapsed().unwrap()
+                > 2 * *config.election_timeout_range.end()
+            {
+                return false;
+            }
+            if check_round_timeout.unwrap_or(false) {
+                if round_start_timestamp.elapsed().unwrap()
+                    > 2 * *config.election_timeout_range.end()
+                {
+                    // Start a new round
+                    // *n_round += 1;
+                    // *round_start_timestamp = SystemTime::now();
+                    // *round_end_index = (pstate.log().len() - 1) as u64;
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => true,
     }
 }
