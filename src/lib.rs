@@ -5,10 +5,9 @@ use std::{
 };
 
 use basic_raft::{
-    check_catch_up_timeout, AddServerProgress, ChangeProgress, ClusterMembershipChangeProgress,
-    ElectionTimeout, HeartbeatTimeout, Init, PersistentState, ProcessType,
+    AddServerProgress, ChangeProgress, ClusterMembershipChangeProgress, ElectionTimeout,
+    HeartbeatTimeout, Init, PersistentState, ProcessType,
 };
-use bincode::de;
 use executor::{Handler, ModuleRef, System, TimerHandle};
 
 pub use domain::*;
@@ -112,7 +111,7 @@ impl Raft {
             let leader_commit = self.commit_index;
 
             let targets: Vec<&Uuid> = match target_one.as_ref() {
-                Some(target) => vec![&target],
+                Some(target) => vec![target],
                 None => match self.new_uncommitted_servers.as_ref() {
                     Some((servers, _)) => servers
                         .iter()
@@ -160,12 +159,10 @@ impl Raft {
                     .unwrap();
 
                 // Used after receiving successful AppendEntries response
+                // send_empty is used to send empty AppendEntries to new server during catchup rounds
                 if target_one.is_some() && entries.is_empty() && !send_empty {
                     break;
                 }
-                debug!(
-                    "Sending AppendEntries to {:?} with prev_log_index: {}, prev_log_term: {}, entries: {:?}, leader_commit: {}",
-                    server, match_index, prev_log_term, entries, leader_commit);
 
                 let msg = RaftMessage {
                     header: RaftMessageHeader {
@@ -202,23 +199,18 @@ impl Raft {
         }
 
         self.common_raft_message_handle(header).await;
+
         let vote_granted = match (
             header.term < self.pstate.current_term(),
             self.pstate.voted_for(),
         ) {
             (false, None) => {
-                // page 22 & 23
                 let logs = self.pstate.log();
                 let last_log_index = logs.len() - 1;
                 let last_log_term = logs.last().map(|e| e.term).unwrap();
-                if args.last_log_term > last_log_term
+                args.last_log_term > last_log_term
                     || (args.last_log_term == last_log_term
                         && args.last_log_index >= last_log_index)
-                {
-                    true
-                } else {
-                    false
-                }
             }
             _ => false,
         };
@@ -245,16 +237,12 @@ impl Raft {
         args: RequestVoteResponseArgs,
     ) {
         self.common_raft_message_handle(header).await;
-        match &mut self.process_type {
-            ProcessType::Follower { .. } => return,
-            ProcessType::Leader { .. } => return,
-            ProcessType::Candidate { votes_received } => {
-                if args.vote_granted {
-                    votes_received.insert(header.source);
-                    if 2 * votes_received.len() > self.config.servers.len() {
-                        self.become_leader().await;
-                    };
-                }
+        if let ProcessType::Candidate { votes_received } = &mut self.process_type {
+            if args.vote_granted {
+                votes_received.insert(header.source);
+                if 2 * votes_received.len() > self.config.servers.len() {
+                    self.become_leader().await;
+                };
             }
         }
     }
@@ -266,7 +254,6 @@ impl Raft {
     ) -> Option<RaftMessageContent> {
         self.common_raft_message_handle(header).await;
         if header.term < self.pstate.current_term() {
-            // self.update_term(header.term).await;
             Some(RaftMessageContent::AppendEntriesResponse(
                 AppendEntriesResponseArgs {
                     success: false,
@@ -281,10 +268,6 @@ impl Raft {
             if let Some(timer_handle) = self.heartbeat_timer_handle.take() {
                 timer_handle.stop().await;
             }
-
-            debug!(
-                "[{}] Received AppendEntries from {:?} with prev_log_index: {}, prev_log_term: {}, entries: {:?}, leader_commit: {}",
-                self.config.self_id, header.source, args.prev_log_index, args.prev_log_term, args.entries, args.leader_commit);
 
             let prev_log_index = args.prev_log_index;
             match self.pstate.log().get(prev_log_index) {
@@ -342,21 +325,19 @@ impl Raft {
                             true
                         }
                     };
-                    return Some(RaftMessageContent::AppendEntriesResponse(
+                    Some(RaftMessageContent::AppendEntriesResponse(
                         AppendEntriesResponseArgs {
                             success,
                             last_verified_log_index,
                         },
-                    ));
+                    ))
                 }
-                None => {
-                    return Some(RaftMessageContent::AppendEntriesResponse(
-                        AppendEntriesResponseArgs {
-                            success: false,
-                            last_verified_log_index: args.prev_log_index + args.entries.len(),
-                        },
-                    ));
-                }
+                None => Some(RaftMessageContent::AppendEntriesResponse(
+                    AppendEntriesResponseArgs {
+                        success: false,
+                        last_verified_log_index: args.prev_log_index + args.entries.len(),
+                    },
+                )),
             }
         }
     }
@@ -558,37 +539,71 @@ impl Raft {
         args: AppendEntriesResponseArgs,
     ) -> Option<RaftMessageContent> {
         self.common_raft_message_handle(header).await;
-        match &mut self.process_type {
-            ProcessType::Leader {
-                next_index,
-                match_index,
-                heartbeats_received,
-                cmcp,
-                ..
-            } => {
-                // If started count if finished but not commited
-                match cmcp {
-                    Some(ClusterMembershipChangeProgress {
+        if let ProcessType::Leader {
+            next_index,
+            match_index,
+            heartbeats_received,
+            cmcp,
+            ..
+        } = &mut self.process_type
+        {
+            // add heartbeat from new server if after catch up rounds
+            match cmcp {
+                Some(ClusterMembershipChangeProgress {
+                    id,
+                    started,
+                    finished_but_uncommited,
+                    ..
+                }) if *id == header.source && *started && *finished_but_uncommited => {
+                    heartbeats_received.insert(header.source);
+                }
+                None => _ = heartbeats_received.insert(header.source),
+                _ => {}
+            }
+
+            match args.success {
+                false => {
+                    if let Some(next_index_val) = next_index.get_mut(&header.source) {
+                        if next_index_val > &mut 0 {
+                            *next_index_val -= 1;
+                        }
+                    }
+                    // check_and_update_catch_up_timeout
+                    if let Some(ClusterMembershipChangeProgress {
                         id,
                         started,
                         finished_but_uncommited,
+                        progress:
+                            ChangeProgress::AddServer(Some(AddServerProgress {
+                                last_timestamp, ..
+                            })),
                         ..
-                    }) if *id == header.source && *started && *finished_but_uncommited => {
-                        heartbeats_received.insert(header.source);
-                    }
-                    None => _ = heartbeats_received.insert(header.source),
-                    _ => {}
-                }
-
-                match args.success {
-                    false => {
-                        if let Some(next_index_val) = next_index.get_mut(&header.source) {
-                            if next_index_val > &mut 0 {
-                                *next_index_val -= 1;
+                    }) = cmcp
+                    {
+                        if *id == header.source && *started && !*finished_but_uncommited {
+                            if last_timestamp.elapsed().unwrap()
+                                > 2 * *self.config.election_timeout_range.end()
+                            {
+                                self.timeout_add_server_change().await;
+                                return None;
+                            } else {
+                                *last_timestamp = SystemTime::now();
                             }
                         }
-                        // check_and_update_catch_up_timeout
-                        if let Some(ClusterMembershipChangeProgress {
+                    }
+
+                    self.send_append_entries(Some(header.source), true).await;
+                }
+                true => {
+                    if let Some(next_index_val) = next_index.get_mut(&header.source) {
+                        *next_index_val = u64::try_from(args.last_verified_log_index).unwrap() + 1;
+                    }
+                    if let Some(match_index_val) = match_index.get_mut(&header.source) {
+                        *match_index_val = args.last_verified_log_index.try_into().unwrap();
+                    }
+
+                    match cmcp {
+                        Some(ClusterMembershipChangeProgress {
                             id,
                             started,
                             finished_but_uncommited,
@@ -600,138 +615,89 @@ impl Raft {
                                     round_end_index,
                                 })),
                             ..
-                        }) = cmcp
-                        {
-                            debug!(
-                                "AddServerProgress: n_round: {}, round_start_timestamp: {:?}, last_timestamp: {:?}, round_end_index: {}",
-                                n_round, round_start_timestamp, last_timestamp, round_end_index
-                            );
-                            if *id == header.source && *started && !*finished_but_uncommited {
-                                if last_timestamp.elapsed().unwrap()
-                                    > 2 * *self.config.election_timeout_range.end()
-                                {
-                                    self.timeout_add_server_change().await;
-                                    return None;
-                                } else {
-                                    *last_timestamp = SystemTime::now();
-                                }
-                            }
-                        }
-
-                        self.send_append_entries(Some(header.source), true).await;
-                    }
-                    true => {
-                        if let Some(next_index_val) = next_index.get_mut(&header.source) {
-                            *next_index_val =
-                                u64::try_from(args.last_verified_log_index).unwrap() + 1;
-                        }
-                        if let Some(match_index_val) = match_index.get_mut(&header.source) {
-                            *match_index_val = args.last_verified_log_index.try_into().unwrap();
-                        }
-
-                        match cmcp {
-                            Some(ClusterMembershipChangeProgress {
-                                id,
-                                started,
-                                finished_but_uncommited,
-                                progress:
-                                    ChangeProgress::AddServer(Some(AddServerProgress {
-                                        n_round,
-                                        round_start_timestamp,
-                                        last_timestamp,
-                                        round_end_index,
-                                    })),
-                                ..
-                            }) if *id == header.source && *started && !*finished_but_uncommited => {
-                                debug!(
-                                    "AddServerProgress: n_round: {}, round_start_timestamp: {:?}, last_timestamp: {:?}, round_end_index: {}",
-                                    n_round, round_start_timestamp, last_timestamp, round_end_index);
-                                if last_timestamp.elapsed().unwrap()
-                                    > 2 * *self.config.election_timeout_range.end()
-                                {
-                                    self.timeout_add_server_change().await;
-                                    return None;
-                                } else {
-                                    let match_index_val = match_index.get(&header.source).unwrap();
-                                    if *round_end_index <= *match_index_val {
-                                        if round_start_timestamp.elapsed().unwrap()
-                                            > 2 * *self.config.election_timeout_range.end()
-                                        {
-                                            self.timeout_add_server_change().await;
-                                            return None;
-                                        } else {
-                                            *n_round += 1;
-                                            if *n_round == self.config.catch_up_rounds
-                                                || *round_end_index
-                                                    == self.pstate.log().len() as u64 - 1
-                                            {
-                                                *finished_but_uncommited = true;
-                                                let mut servers = self.config.servers.clone();
-                                                servers.insert(*id);
-                                                self.pstate
-                                                    .append_log(LogEntry {
-                                                        content: LogEntryContent::Configuration {
-                                                            servers: servers.clone(),
-                                                        },
-                                                        term: self.pstate.current_term(),
-                                                        timestamp: SystemTime::now(),
-                                                    })
-                                                    .await;
-                                                self.new_uncommitted_servers =
-                                                    Some((servers, self.pstate.log().len() - 1));
-                                            } else {
-                                                *round_start_timestamp = SystemTime::now();
-                                                *round_end_index =
-                                                    (self.pstate.log().len() - 1) as u64;
-                                            }
-                                        }
-                                    }
-                                    *last_timestamp = SystemTime::now();
-                                    self.send_append_entries(Some(header.source), true).await;
-                                    return None;
-                                }
-                            }
-                            _ => {
-                                if let Some((servers, _)) = &self.new_uncommitted_servers {
-                                    if !servers.contains(&header.source) {
+                        }) if *id == header.source && *started && !*finished_but_uncommited => {
+                            if last_timestamp.elapsed().unwrap()
+                                > 2 * *self.config.election_timeout_range.end()
+                            {
+                                self.timeout_add_server_change().await;
+                                return None;
+                            } else {
+                                let match_index_val = match_index.get(&header.source).unwrap();
+                                if *round_end_index <= *match_index_val {
+                                    if round_start_timestamp.elapsed().unwrap()
+                                        > 2 * *self.config.election_timeout_range.end()
+                                    {
+                                        self.timeout_add_server_change().await;
                                         return None;
-                                    }
-                                }
-                                for new_commit_index in
-                                    self.commit_index..=args.last_verified_log_index
-                                {
-                                    // One because self if not counted in match_index
-                                    let mut count = 1;
-                                    if let Some((servers, _)) = &self.new_uncommitted_servers {
-                                        if !servers.contains(&self.config.self_id) {
-                                            count = 0;
-                                        }
-                                    }
-                                    for (_, match_index) in match_index.iter() {
-                                        if *match_index >= new_commit_index.try_into().unwrap() {
-                                            count += 1;
-                                        }
-                                    }
-                                    if 2 * count > self.config.servers.len() {
-                                        match self.pstate.log().get(new_commit_index) {
-                                            Some(LogEntry { term, .. }) => {
-                                                if term == &self.pstate.current_term() {
-                                                    self.commit_index = new_commit_index;
-                                                }
-                                            }
-                                            None => break,
-                                        }
                                     } else {
-                                        break;
+                                        *n_round += 1;
+                                        if *n_round == self.config.catch_up_rounds
+                                            || *round_end_index
+                                                == self.pstate.log().len() as u64 - 1
+                                        {
+                                            *finished_but_uncommited = true;
+                                            let mut servers = self.config.servers.clone();
+                                            servers.insert(*id);
+                                            self.pstate
+                                                .append_log(LogEntry {
+                                                    content: LogEntryContent::Configuration {
+                                                        servers: servers.clone(),
+                                                    },
+                                                    term: self.pstate.current_term(),
+                                                    timestamp: SystemTime::now(),
+                                                })
+                                                .await;
+                                            self.new_uncommitted_servers =
+                                                Some((servers, self.pstate.log().len() - 1));
+                                        } else {
+                                            *round_start_timestamp = SystemTime::now();
+                                            *round_end_index = (self.pstate.log().len() - 1) as u64;
+                                        }
                                     }
                                 }
-                                self.apply_logs_leader().await;
+                                *last_timestamp = SystemTime::now();
+                                self.send_append_entries(Some(header.source), true).await;
+                                return None;
                             }
+                        }
+                        _ => {
+                            if let Some((servers, _)) = &self.new_uncommitted_servers {
+                                if !servers.contains(&header.source) {
+                                    return None;
+                                }
+                            }
+                            for new_commit_index in self.commit_index..=args.last_verified_log_index
+                            {
+                                // One because self if not counted in match_index
+                                let mut count = 1;
+                                if let Some((servers, _)) = &self.new_uncommitted_servers {
+                                    if !servers.contains(&self.config.self_id) {
+                                        count = 0;
+                                    }
+                                }
+                                for (_, match_index) in match_index.iter() {
+                                    if *match_index >= new_commit_index.try_into().unwrap() {
+                                        count += 1;
+                                    }
+                                }
+                                if 2 * count > self.config.servers.len() {
+                                    match self.pstate.log().get(new_commit_index) {
+                                        Some(LogEntry { term, .. }) => {
+                                            if term == &self.pstate.current_term() {
+                                                self.commit_index = new_commit_index;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.apply_logs_leader().await;
                         }
                     }
                 }
             }
-            _ => {}
         }
         None
     }
@@ -815,20 +781,10 @@ impl Raft {
                     ..
                 }) = cmcp
                 {
-                    assert!(!*started);
-                    assert!(self.new_uncommitted_servers.is_none());
+                    debug_assert!(!*started);
+                    debug_assert!(self.new_uncommitted_servers.is_none());
                     match progress {
                         ChangeProgress::AddServer(None) => {
-                            // let mut new_uncommitted_servers = self.config.servers.clone();
-                            // new_uncommitted_servers.insert(*id);
-                            // self.pstate.append_log(LogEntry {
-                            //     term: self.pstate.current_term(),
-                            //     timestamp: SystemTime::now(),
-                            //     content: LogEntryContent::Configuration {
-                            //         servers: new_uncommitted_servers.clone(),
-                            //     }
-                            // }).await;
-                            // self.new_uncommitted_servers = Some((new_uncommitted_servers, self.pstate.log().len() - 1));
                             *progress = ChangeProgress::AddServer(Some(AddServerProgress {
                                 n_round: 0,
                                 round_start_timestamp: SystemTime::now(),
@@ -871,65 +827,11 @@ impl Raft {
             }
             _ => unreachable!(),
         };
-        debug!(
-            "Start cluster membership change, leader: {:?}",
-            self.process_type
-        );
         if let Some(send_append_entries_id) = send_append_entries_id {
-            // Start sending append entries to new server
-            debug!(
-                "Start sending append entries to new server: {:?}",
-                send_append_entries_id
-            );
             self.send_append_entries(Some(send_append_entries_id), true)
                 .await;
         }
     }
-
-    // fn check_catch_up_timeout(
-    //     &self,
-    //     cmcp: &mut Option<ClusterMembershipChangeProgress>,
-    //     check_round_timeout: Option<bool>,
-    // ) -> bool {
-    //     match &mut self.process_type {
-    //         ProcessType::Leader { cmcp, .. } => {
-    //             match cmcp {
-    //                 Some(ClusterMembershipChangeProgress {
-    //                     progress:
-    //                         ChangeProgress::AddServer(Some(AddServerProgress {
-    //                             n_round,
-    //                             round_start_timestamp,
-    //                             last_timestamp,
-    //                             round_end_index,
-    //                         })),
-    //                     finished_but_uncommited,
-    //                     ..
-    //                 }) if !*finished_but_uncommited => {
-    //                     if last_timestamp.elapsed().unwrap()
-    //                         > 2 * *self.config.election_timeout_range.end()
-    //                     {
-    //                         return false;
-    //                     }
-    //                     if check_round_timeout.unwrap_or(false) {
-    //                         if round_start_timestamp.elapsed().unwrap()
-    //                             > 2 * *self.config.election_timeout_range.end()
-    //                         {
-    //                             // Start a new round
-    //                             *n_round += 1;
-    //                             *round_start_timestamp = SystemTime::now();
-    //                             *round_end_index = (self.pstate.log().len() - 1) as u64;
-    //                         } else {
-    //                             return false;
-    //                         }
-    //                     }
-    //                     true
-    //                 }
-    //                 _ => true,
-    //             }
-    //         }
-    //         _ => unreachable!(),
-    //     }
-    // }
 
     async fn timeout_add_server_change(&mut self) {
         match &mut self.process_type {
@@ -1041,21 +943,19 @@ impl Handler<ClientRequest> for Raft {
                             self.commit_index += 1;
                             self.apply_logs_leader().await;
                         }
-                    } else {
-                        if let Err(e) = msg
-                            .reply_to
-                            .send(ClientRequestResponse::CommandResponse(
-                                CommandResponseArgs {
-                                    client_id,
-                                    sequence_num,
-                                    content: CommandResponseContent::SessionExpired,
-                                },
-                            ))
-                            .await
-                        {
-                            error!("Failed to send command response to client: {}", e);
-                        };
-                    }
+                    } else if let Err(e) = msg
+                        .reply_to
+                        .send(ClientRequestResponse::CommandResponse(
+                            CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: CommandResponseContent::SessionExpired,
+                            },
+                        ))
+                        .await
+                    {
+                        error!("Failed to send command response to client: {}", e);
+                    };
                 }
                 _ => {
                     if let Err(e) = msg
@@ -1091,13 +991,12 @@ impl Handler<ClientRequest> for Raft {
                                     client_tx: msg.reply_to.clone(),
                                     progress: ChangeProgress::AddServer(None),
                                 });
-                                match self.pstate.log().get(self.commit_index) {
-                                    Some(LogEntry { term, .. }) => {
-                                        if *term >= self.pstate.current_term() {
-                                            self.start_cluster_membership_change().await;
-                                        }
+                                if let Some(LogEntry { term, .. }) =
+                                    self.pstate.log().get(self.commit_index)
+                                {
+                                    if *term >= self.pstate.current_term() {
+                                        self.start_cluster_membership_change().await;
                                     }
-                                    _ => {}
                                 }
                                 None
                             }
@@ -1145,24 +1044,20 @@ impl Handler<ClientRequest> for Raft {
                                     client_tx: msg.reply_to.clone(),
                                     progress: ChangeProgress::RemoveServer,
                                 });
-                                match self.pstate.log().get(self.commit_index) {
-                                    Some(LogEntry { term, .. }) => {
-                                        if *term >= self.pstate.current_term() {
-                                            self.start_cluster_membership_change().await;
-                                        }
+                                if let Some(LogEntry { term, .. }) =
+                                    self.pstate.log().get(self.commit_index)
+                                {
+                                    if *term >= self.pstate.current_term() {
+                                        self.start_cluster_membership_change().await;
                                     }
-                                    _ => {}
                                 }
                                 None
                             }
                         }
                     }
-                    _ => {
-                        debug!("Received add server request from client, but not leader");
-                        Some(RemoveServerResponseContent::NotLeader {
-                            leader_hint: self.current_leader,
-                        })
-                    }
+                    _ => Some(RemoveServerResponseContent::NotLeader {
+                        leader_hint: self.current_leader,
+                    }),
                 };
 
                 if let Some(content) = maybe_content {
@@ -1290,10 +1185,8 @@ impl Handler<HeartbeatTimeout> for Raft {
             heartbeats_received.clear();
             heartbeats_received.insert(self.config.self_id);
             self.send_append_entries(None, false).await;
-        } else {
-            if let Some(heartbeat_timer_handle) = self.heartbeat_timer_handle.take() {
-                heartbeat_timer_handle.stop().await;
-            }
+        } else if let Some(heartbeat_timer_handle) = self.heartbeat_timer_handle.take() {
+            heartbeat_timer_handle.stop().await;
         }
     }
 }
